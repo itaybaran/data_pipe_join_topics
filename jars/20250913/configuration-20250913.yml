@@ -1,0 +1,82 @@
+parallelism: 1
+
+logger:
+  log_level: "INFO"
+  log_name: "data_flink_poc"
+
+jars:
+  # Define JAR Paths
+  JAR_DIR: "/workspaces/data_etl_flinkjob/jars"
+
+kafka:
+  OUTPUT_KAFKA_BROKER: 'sltmkkfka-app10.clalit.org.il:9033,sltmkkfka-app08.clalit.org.il:9033,sltmkkfka-app09.clalit.org.il:9033'
+  INPUT_KAFKA_BROKER: 'sltmkkfka-app10.clalit.org.il:9033,sltmkkfka-app08.clalit.org.il:9033,sltmkkfka-app09.clalit.org.il:9033'
+  ERROR_KAFKA_BROKER: 'sltmkkfka-app10.clalit.org.il:9033,sltmkkfka-app08.clalit.org.il:9033,sltmkkfka-app09.clalit.org.il:9033'
+  INPUT_TOPIC: 'DEV_01.TibApp_RIS_HL7.SendToEMSBI.Kafka'
+  OUTPUT_TOPIC: 'DEV_01.Data.RIS_HL7_Flat.json.kafka'
+  ERROR_TOPIC: 'DEV_01.Data.Flink_Errors.json.kafka'
+  GROUP_ID: 'TEST_01.flink-poc.topic-cg1'
+  SECURITY_PROTOCOL: 'SSL'
+  SASL_MECHANISM: 'PLAIN'
+  
+  input_kafka_properties: #No authentication on port 9033
+    bootstrap.servers: 'sltmkkfka-app10.clalit.org.il:9033,sltmkkfka-app08.clalit.org.il:9033,sltmkkfka-app09.clalit.org.il:9033'
+    group.id": 'TEST_01.flink-poc.topic-cg1'
+    #"security.protocol":SECURITY_PROTOCOL,
+
+  output_kafka_properties: #No authentication on port 9033
+    bootstrap.servers: 'sltmkkfka-app10.clalit.org.il:9033,sltmkkfka-app08.clalit.org.il:9033,sltmkkfka-app09.clalit.org.il:9033'
+    group.id": 'TEST_01.flink-poc.topic-cg1'
+    #security.protocol: 'SECURITY_PROTOCOL'
+    #sasl.mechanism : 'SASL_MECHANISM'
+
+  error_kafka_properties: #No authentication on port 9033
+    bootstrap.servers: 'sltmkkfka-app10.clalit.org.il:9033,sltmkkfka-app08.clalit.org.il:9033,sltmkkfka-app09.clalit.org.il:9033'
+    group.id": 'TEST_01.flink-poc.topic-cg1'
+    #security.protocol: 'SECURITY_PROTOCOL'
+    #sasl.mechanism : 'SASL_MECHANISM'
+
+flink_steps:
+  -
+    type: hl7_reader
+    order: 1
+    hl7_json_key: "payload.text"
+    xml_tag: "ns2:fileContent"
+    hl7_data_model_code: "POC"
+    attributes: "1234"
+    hl7_key: "101"
+    hl7_spliters: ["MSH","PID","PV1","ORC","OBR"]
+
+  -
+    type: parsing
+    order: 2
+    seperator: "$$$"
+  # when the Json message is nested we will use a seperator to extract the value ex. "MSH$$$MSH_2_1" = {MSH:{MSH_2_1:[Value]}}
+    extracted_fields:
+      msh.mesa_of: "MSH$$$MSH_2_1"
+      msh.department: "MSH$$$MSH_3_1"
+      msh.department_code: "MSH$$$MSH_5_1"
+      msh.some_date: "MSH$$$MSH_6_1"
+      msh.company.orm: "MSH$$$MSH_8_1"
+    # create a new Json message structure based on the extracted fields
+    data_message:
+      msh.mesa_of: "$"
+      msh.department: "$"
+      msh.department_code: "$"
+      msh.some_date: "$"
+      msh.company.orm: "$"
+    
+  -
+    type: add_attributes
+    order: 3
+    instuctions: 
+        DateTimeKafkaData: True
+        MessageIdKafkaData: True
+        RowNum: True
+        MaxRowNum: True
+
+flow_manager:
+# Setting the steps and order of the process flow as an array of Objects: [{{"is_active":[True/False]},{"order":[Number]},{"step":[StepName]}},....]
+- {is_active: True, order: 1, name: "hl7_parser"}
+- {is_active: True, order: 2, name: "data_extractor"}
+- {is_active: True, order: 3, name: "add_attributes"}

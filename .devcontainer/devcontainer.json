@@ -1,0 +1,31 @@
+{
+  "name": "PyFlink Dev (Podman)",
+  "build": { "dockerfile": "Dockerfile", "context": "." },
+
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+
+  "settings": {
+    "python.defaultInterpreterPath": "${containerWorkspaceFolder}/.venv/bin/python"
+  },
+  "containerEnv": {
+    "WAYLAND_DISPLAY": "",
+    "DISPLAY": ""
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python","ms-python.vscode-pylance","ms-toolsai.jupyter"]
+    }
+  },
+  // ...your existing fields...
+  "settings": { "python.defaultInterpreterPath": "/home/vscode/.venv/bin/python" },
+  "containerEnv": {
+    "PYFLINK_CLIENT_EXECUTABLE": "",
+    "PYFLINK_EXECUTABLE": "/home/vscode/.venv/bin/python"
+  },
+  "runArgs": ["--network", "devnet"],
+  "postCreateCommand": "/usr/bin/env bash -lc 'python3 -m venv /home/vscode/.venv && /home/vscode/.venv/bin/python -m pip install -U pip && /home/vscode/.venv/bin/pip install --no-cache-dir -r ${containerWorkspaceFolder}/requirements.txt'",
+  "containerEnv": {
+    "WAYLAND_DISPLAY": "",
+    "DISPLAY": ""
+  }
+}

@@ -1,0 +1,11 @@
+{
+    "name": "Flink Dev Container",
+    "build": {
+      "dockerfile": "../Dockerfile"
+    },
+    "postCreateCommand": "bash -i ./scripts/init.sh",
+    "runArgs": [
+    "--network=host"
+  ]
+
+  }
