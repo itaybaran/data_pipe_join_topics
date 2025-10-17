@@ -7,6 +7,9 @@ import hashlib
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
+from pathlib import Path
+from dotenv import load_dotenv, find_dotenv
+
 from pyflink.common import Configuration, Types
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.common.watermark_strategy import WatermarkStrategy
@@ -36,9 +39,19 @@ from configuration import Config
 # ========================
 # Runtime / Env bootstrap
 # ========================
-
+# Finds the nearest .env walking up from current file/cwd
+load_dotenv(find_dotenv())   # or load_dotenv(Path(__file__).with_name(".env"))
 # path to Python in your devcontainer venv
-PY = "/home/vscode/.venv/bin/python"
+PY = os.getenv("PY", "production")  # default fallback
+APP_ENV   = os.getenv("APP_ENV", "production")  # default fallback
+DEBUG     = os.getenv("DEBUG", "false").lower() == "true"
+PORT      = int(os.getenv("PORT", "8000"))
+SECRET    = os.getenv("SECRET_KEY")             # keep out of source control
+STATE_CHECKPOINTS_DIR =  os.getenv("STATE_CHECKPOINTS_DIR")
+CONFIG_FILE_PATH = os.getenv("CONFIG_FILE_PATH")
+PARALLELISM = int(os.getenv("PARALLELISM"))
+
+
 os.environ["PYFLINK_CLIENT_EXECUTABLE"] = PY
 os.environ["PYFLINK_EXECUTABLE"] = PY
 
@@ -47,19 +60,18 @@ config.set_string("classloader.resolve-order", "parent-first")
 config.set_string("python.client.executable", PY)
 config.set_string("python.executable", PY)
 # Local FS for checkpoints in dev; use durable storage in real clusters
-config.set_string("state.checkpoints.dir", "file:///workspaces/data_pipe_join_topics/tmp/flink-checkpoints")
+config.set_string("state.checkpoints.dir", STATE_CHECKPOINTS_DIR)
 
 # Make Python operators flush small, frequent bundles (helps checkpointing)
 config.set_string("python.fn-execution.bundle.size", "100")
 config.set_string("python.fn-execution.bundle.time", "100")  # ms
 
 # Load YAML configuration
-config_file_path = "configurations/configuration.yml"
-data_config = Config(config_file_path).get_config()
+data_config = Config(CONFIG_FILE_PATH).get_config()
 
 # Create env
 env = StreamExecutionEnvironment.get_execution_environment(configuration=config)
-env.set_parallelism(data_config.get("parallelism", 1))
+env.set_parallelism(data_config.get("parallelism", PARALLELISM))
 env.set_restart_strategy(RestartStrategies.fixed_delay_restart(3, 10_000))
 
 # --- Checkpointing (dev-friendly, robust) ---
@@ -77,8 +89,8 @@ chk.enable_externalized_checkpoints(ExternalizedCheckpointCleanup.RETAIN_ON_CANC
 wm = WatermarkStrategy.no_watermarks()
 
 # --- Add connector JARs (if needed; harmless if already on classpath) ---
-FLINK_KAFKA_JAR = "file:///workspaces/data_pipe_join_topics/jars/flink-connector-kafka-3.4.0-1.20.jar"
-KAFKA_CLIENTS_JAR = "file:///workspaces/data_pipe_join_topics/jars/kafka-clients-3.9.0.jar"
+FLINK_KAFKA_JAR = os.getenv("FLINK_KAFKA_JAR")
+KAFKA_CLIENTS_JAR = os.getenv("KAFKA_CLIENTS_JAR")
 env.add_jars(FLINK_KAFKA_JAR, KAFKA_CLIENTS_JAR)
 
 # --- Kafka config from YAML ---
