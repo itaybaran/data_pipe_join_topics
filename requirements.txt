@@ -39,6 +39,7 @@ pyflink==1.0
 pymongo==4.11.1
 pyparsing==3.2.1
 python-dateutil==2.9.0.post0
+python-dotenv==1.1.1
 pytz==2025.1
 PyYAML==6.0.2
 regex==2024.11.6
