@@ -33,7 +33,7 @@ from pyflink.datastream.state import ValueStateDescriptor, StateTtlConfig
 from pyflink.common import Time
 
 from configuration import Config
-# from utils.logger import Logger  # keep if you use it elsewhere
+from logger import Logger
 
 
 # ========================
@@ -67,9 +67,11 @@ config.set_string("python.fn-execution.bundle.size", "100")
 config.set_string("python.fn-execution.bundle.time", "100")  # ms
 
 # Load YAML configuration
-data_config = Config(CONFIG_FILE_PATH).get_config()
-
+main_config = Config(CONFIG_FILE_PATH)
+data_config = main_config.get_config()
+logger = Logger(main_config)
 # Create env
+logger.insert_debug_to_log("Direct Script","start")
 env = StreamExecutionEnvironment.get_execution_environment(configuration=config)
 env.set_parallelism(data_config.get("parallelism", PARALLELISM))
 env.set_restart_strategy(RestartStrategies.fixed_delay_restart(3, 10_000))
@@ -100,7 +102,7 @@ OUTPUT_TOPIC = data_config["kafka"]["OUTPUT_TOPIC"]  # e.g., 'fhir.labs.output.K
 input_kafka_properties = data_config["kafka"]["input_kafka_properties"]
 input_kafka_properties["client.id"] = socket.gethostname()
 output_kafka_properties = data_config["kafka"]["output_kafka_properties"]
-# error_kafka_properties = data_config["kafka"]["error_kafka_properties"]
+logger.insert_debug_to_log("Direct Script","end setting env")
 
 
 # ========================
@@ -109,6 +111,7 @@ output_kafka_properties = data_config["kafka"]["output_kafka_properties"]
 
 def json_source(env: StreamExecutionEnvironment, topic: str, bootstrap: str):
     """Create a Kafka source that outputs Python dicts parsed from JSON strings."""
+    logger.insert_debug_to_log("Builders.json_source","enter function")
     src = (
         KafkaSource.builder()
         .set_bootstrap_servers(bootstrap)
@@ -123,6 +126,7 @@ def json_source(env: StreamExecutionEnvironment, topic: str, bootstrap: str):
 
 def build_string_kafka_sink(kafka_props: Dict[str, Any], topic: str) -> KafkaSink:
     """KafkaSink that expects **String** values (JSON text)."""
+    logger.insert_debug_to_log("Builders.json_source","enter function")
     bootstrap = kafka_props.get("bootstrap.servers")
     record_ser = (
         KafkaRecordSerializationSchema.builder()
@@ -141,6 +145,7 @@ def build_string_kafka_sink(kafka_props: Dict[str, Any], topic: str) -> KafkaSin
 
 def _dig(obj: Dict[str, Any], path: str):
     """Safely get nested value by dot path, returns None if any segment missing."""
+    logger.insert_debug_to_log("Builders._dig","enter function")
     cur = obj
     for seg in str(path).split("."):
         if cur is None:
@@ -154,6 +159,7 @@ def _dig(obj: Dict[str, Any], path: str):
 
 def make_key_extractor(cfg: Dict[str, Any]):
     """Returns a function that extracts parent_key from a tagged record using cfg."""
+    logger.insert_debug_to_log("Builders.make_key_extractor","enter function")
     parts_cfg = cfg["kafka"]["parts"]
 
     def extract(e: Dict[str, Any]):
@@ -187,6 +193,7 @@ class LabAgg:
         return True
 
     def as_enriched(self) -> Optional[Dict[str, Any]]:
+        logger.insert_debug_to_log("Data.as_enriched","enter function")
         return self.data if self.is_ready() else None
 
 
@@ -219,6 +226,7 @@ class MergeAll(KeyedProcessFunction):
         tagged: {"kind": "<PART_NAME>", "row": {...}, "parent_key": <optional>}
         Emits: enriched dicts (yield)
         """
+        logger.insert_debug_to_log("DMergeAll.process_element","enter function")
         kind = (tagged.get("kind") or "").strip()
         if not kind:
             return
@@ -230,7 +238,7 @@ class MergeAll(KeyedProcessFunction):
             parent_key = extractor(tagged)
         if not parent_key:
             # Debug: show why we dropped it
-            print(f"[PROCESS] drop: missing key for kind={kind}")
+            logger.insert_info_to_log("MergeAll.process_element",f"[PROCESS] drop: missing key for kind={kind}")
             return
 
         agg = self._get_or_init(parent_key)
@@ -248,14 +256,14 @@ class MergeAll(KeyedProcessFunction):
         # build enriched and de-dup BEFORE emitting
         enriched = agg.as_enriched()
         if enriched is None:
-            print(f"[PROCESS] not ready key={parent_key}, have={list(agg.data.keys())}")
+            logger.insert_info_to_log("MergeAll.process_element",f"[PROCESS] not ready key={parent_key}, have={list(agg.data.keys())}")
             return
 
         vhash = self._stable_hash(enriched)
         if vhash != getattr(agg, "last_version", None):
             agg.last_version = vhash
             self.agg_state.update(agg)
-            print(f"[PROCESS] EMIT key={parent_key}")
+            logger.insert_info_to_log("MergeAll.process_element",f"[PROCESS] EMIT key={parent_key}")
             yield enriched
         else:
             # unchanged; skip emit
@@ -265,56 +273,60 @@ class MergeAll(KeyedProcessFunction):
 # ========================
 # Graph wiring
 # ========================
+def main(env):
+    # Build per-topic sources → tagged union
+    kafka_sources = []
+    logger = Logger(main_config)
+    for part in data_config["kafka"]["parts"]:
+        topic = part["topic"]
+        bootstrap = part["bootstrap"]
+        name = part["name"]
 
-# Build per-topic sources → tagged union
-kafka_sources = []
-for part in data_config["kafka"]["parts"]:
-    topic = part["topic"]
-    bootstrap = part["bootstrap"]
-    name = part["name"]
+        src = json_source(env, topic, bootstrap).map(
+            # bind name to default arg so lambda captures its value
+            lambda r, _name=name: {"kind": _name, "row": r},
+            output_type=Types.MAP(Types.STRING(), Types.PICKLED_BYTE_ARRAY())
+        )
+        kafka_sources.append(src)
 
-    src = json_source(env, topic, bootstrap).map(
-        # bind name to default arg so lambda captures its value
-        lambda r, _name=name: {"kind": _name, "row": r},
-        output_type=Types.MAP(Types.STRING(), Types.PICKLED_BYTE_ARRAY())
+    if not kafka_sources:
+        raise RuntimeError("No Kafka parts configured in configuration.yml")
+
+    # Union all sources
+    unioned = kafka_sources[0]
+    for i in range(1, len(kafka_sources)):
+        unioned = unioned.union(kafka_sources[i])
+
+    # Attach parent_key to each record (so keyBy doesn't rebuild it per record)
+    extract_parent_key = make_key_extractor(data_config)
+    with_key = (
+        unioned
+        .map(lambda e: {**e, "parent_key": extract_parent_key(e)},
+            output_type=Types.MAP(Types.STRING(), Types.PICKLED_BYTE_ARRAY()))
+        .filter(lambda e: e["parent_key"] is not None)
     )
-    kafka_sources.append(src)
 
-if not kafka_sources:
-    raise RuntimeError("No Kafka parts configured in configuration.yml")
+    # Key by parent_key and merge into one per-key state object
+    result_stream = with_key.key_by(lambda e: e["parent_key"]).process(
+        MergeAll(data_config),
+        # Type bridge for Python operator results across the JVM boundary
+        output_type=Types.PICKLED_BYTE_ARRAY()
+    )
 
-# Union all sources
-unioned = kafka_sources[0]
-for i in range(1, len(kafka_sources)):
-    unioned = unioned.union(kafka_sources[i])
-
-# Attach parent_key to each record (so keyBy doesn't rebuild it per record)
-extract_parent_key = make_key_extractor(data_config)
-with_key = (
-    unioned
-    .map(lambda e: {**e, "parent_key": extract_parent_key(e)},
-         output_type=Types.MAP(Types.STRING(), Types.PICKLED_BYTE_ARRAY()))
-    .filter(lambda e: e["parent_key"] is not None)
-)
-
-# Key by parent_key and merge into one per-key state object
-result_stream = with_key.key_by(lambda e: e["parent_key"]).process(
-    MergeAll(data_config),
-    # Type bridge for Python operator results across the JVM boundary
-    output_type=Types.PICKLED_BYTE_ARRAY()
-)
-
-# Sink: dict -> JSON string (ensure Java String for SimpleStringSchema)
-kafka_sink = build_string_kafka_sink(output_kafka_properties, OUTPUT_TOPIC)
-(
-    result_stream
-    .map(lambda d: json.dumps(d, ensure_ascii=False), output_type=Types.STRING())
-    .sink_to(kafka_sink)
-    .name("enriched-json-out")
-)
+    # Sink: dict -> JSON string (ensure Java String for SimpleStringSchema)
+    kafka_sink = build_string_kafka_sink(output_kafka_properties, OUTPUT_TOPIC)
+    (
+        result_stream
+        .map(lambda d: json.dumps(d, ensure_ascii=False), output_type=Types.STRING())
+        .sink_to(kafka_sink)
+        .name("enriched-json-out")
+    )
+    env.execute("Kafka Streaming with Flink Kafka Connector")
+    logger.insert_debug_to_log("env.execute","finish init")
 
 # Execute
 if __name__ == "__main__":
-    print("SINK topic:", OUTPUT_TOPIC)
-    print("SINK bootstrap:", output_kafka_properties.get("bootstrap.servers"))
-    env.execute("Kafka Streaming with Flink Kafka Connector")
+    logger.insert_info_to_log("SINK topic:",OUTPUT_TOPIC)
+    logger.insert_info_to_log("SINK bootstrap:",output_kafka_properties.get("bootstrap.servers"))
+    main(env)
+    
