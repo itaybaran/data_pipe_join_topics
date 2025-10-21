@@ -134,5 +134,8 @@ dmypy.json
 # pytype static type analyzer
 .pytype/
 
+# Flink temp files and checkpoints in dev environment
+tmp
+
 # Cython debug symbols
 cython_debug/
