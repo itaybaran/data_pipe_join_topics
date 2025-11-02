@@ -3,19 +3,25 @@ import time
 import os
 import uuid
 import json
+from kafka_producer import ConfluentProducer
+from dotenv import load_dotenv, find_dotenv
 
 class Logger:
-    def __init__(self,configuration):
-        self.batch_id = "" #str(uuid.uuid4())
-        self.log_level=configuration.get_log_level()
-        self.logger = logging.getLogger(configuration.get_log_name())
+    def __init__(self):
+        self.batch_id = str(uuid.uuid4())
+        self.log_level=os.getenv("LOG_LEVEL")
+        self.logger = logging.getLogger()
         self.log_information = {'search_fields': {'function_name': 'name', 'batch_id': 'batchId'},
                                 'attribute_data': {'msg': 'message'}}
         self.log_debug = {'search_fields': {'function_name': 'name', 'batch_id': 'batchId'},
                                 'attribute_data': {'msg': 'message'}}
         self.log_error = {'search_fields': {'function_name': 'name', 'batch_id': 'batchId'},
                           'attribute_data': {'error_code': "--", 'error_type': 'type', 'err_msg': 'message'}}
+        self.kafka_client_auth = {"bootstrap.servers": "kafka:29092","security.protocol": "PLAINTEXT"}
+        self.audit_poducer = ConfluentProducer(os.getenv("AUDIT_TOPIC"),os.getenv("PRODUCER_BATCH_SIZE"),self.kafka_client_auth)
+        self.error_poducer = ConfluentProducer(os.getenv("ERROR_TOPIC"),os.getenv("PRODUCER_BATCH_SIZE"),self.kafka_client_auth)
         self.set_logger()
+
 
     def set_logger(self):
         try:
@@ -44,18 +50,24 @@ class Logger:
         self.log_error['attribute_data']['error_type'] = errorType
         self.log_error['attribute_data']['err_msg'] = errMsg
         self.logger.error(str(self.log_error))
+        self.error_poducer.send(self.log_error)
 
     def insert_info_to_log(self, function_name, msg):
         self.log_information['search_fields']['batch_id'] = self.batch_id
         self.log_information['search_fields']['function_name'] = function_name
         self.log_information['attribute_data']['msg'] = msg
         self.logger.info((self.log_information))
+        if self.logger.level <= logging.INFO:
+            self.audit_poducer.send(self.log_information)
+
 
     def insert_debug_to_log(self, function_name, msg):
         self.log_debug['search_fields']['batch_id'] = self.batch_id
         self.log_debug['search_fields']['function_name'] = function_name
         self.log_debug['attribute_data']['msg'] = msg
         self.logger.debug(str(self.log_debug))
+        if self.logger.level <= logging.INFO:
+            self.audit_poducer.send(self.log_debug)
 
     def format_json(self, log_dict):
          # .encode('utf8')
@@ -76,7 +88,7 @@ class Logger:
         codes =  [{"AssertionError":4112},{"ValidatorError":4111},
                   {"DataExtractorError":4121},{"HL7ParserError":4131},
                   {"FilterError":4141},{"OperatorError":4151},
-                  {"ExplodeError":4161},{"SaveStateError":4171}]
+                  {"ExplodeError":4161},{"EnrichError":4171}]
         for element in codes:
             for key in element:
                 if key == error_type:

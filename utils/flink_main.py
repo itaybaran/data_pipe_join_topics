@@ -4,6 +4,7 @@ import os
 import json
 import socket
 import hashlib
+import uuid
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
@@ -42,7 +43,7 @@ from logger import Logger
 # Finds the nearest .env walking up from current file/cwd
 load_dotenv(find_dotenv())   # or load_dotenv(Path(__file__).with_name(".env"))
 # path to Python in your devcontainer venv
-PY = os.getenv("PY", "production")  # default fallback
+PY = os.getenv("PY", "/home/vscode/.venv/bin/python")  # default fallback
 APP_ENV   = os.getenv("APP_ENV", "production")  # default fallback
 DEBUG     = os.getenv("DEBUG", "false").lower() == "true"
 PORT      = int(os.getenv("PORT", "8000"))
@@ -50,6 +51,13 @@ SECRET    = os.getenv("SECRET_KEY")             # keep out of source control
 STATE_CHECKPOINTS_DIR =  os.getenv("STATE_CHECKPOINTS_DIR")
 CONFIG_FILE_PATH = os.getenv("CONFIG_FILE_PATH")
 PARALLELISM = int(os.getenv("PARALLELISM"))
+OUTPUT_TOPIC   = os.getenv("OUTPUT_TOPIC")  
+ERROR_TOPIC   = os.getenv("ERROR_TOPIC") 
+AUDIT_TOPIC   = os.getenv("AUDIT_TOPIC")
+
+# Load YAML configuration
+main_config = Config(CONFIG_FILE_PATH)
+data_config = main_config.get_config()
 
 
 os.environ["PYFLINK_CLIENT_EXECUTABLE"] = PY
@@ -66,12 +74,6 @@ config.set_string("state.checkpoints.dir", STATE_CHECKPOINTS_DIR)
 config.set_string("python.fn-execution.bundle.size", "100")
 config.set_string("python.fn-execution.bundle.time", "100")  # ms
 
-# Load YAML configuration
-main_config = Config(CONFIG_FILE_PATH)
-data_config = main_config.get_config()
-logger = Logger(main_config)
-# Create env
-logger.insert_debug_to_log("Direct Script","start")
 env = StreamExecutionEnvironment.get_execution_environment(configuration=config)
 env.set_parallelism(data_config.get("parallelism", PARALLELISM))
 env.set_restart_strategy(RestartStrategies.fixed_delay_restart(3, 10_000))
@@ -95,14 +97,9 @@ FLINK_KAFKA_JAR = os.getenv("FLINK_KAFKA_JAR")
 KAFKA_CLIENTS_JAR = os.getenv("KAFKA_CLIENTS_JAR")
 env.add_jars(FLINK_KAFKA_JAR, KAFKA_CLIENTS_JAR)
 
-# --- Kafka config from YAML ---
-OUTPUT_TOPIC = data_config["kafka"]["OUTPUT_TOPIC"]  # e.g., 'fhir.labs.output.Kafka'
-# ERROR_TOPIC = data_config["kafka"]["ERROR_TOPIC"]  # optional
-
 input_kafka_properties = data_config["kafka"]["input_kafka_properties"]
 input_kafka_properties["client.id"] = socket.gethostname()
 output_kafka_properties = data_config["kafka"]["output_kafka_properties"]
-logger.insert_debug_to_log("Direct Script","end setting env")
 
 
 # ========================
@@ -111,7 +108,6 @@ logger.insert_debug_to_log("Direct Script","end setting env")
 
 def json_source(env: StreamExecutionEnvironment, topic: str, bootstrap: str):
     """Create a Kafka source that outputs Python dicts parsed from JSON strings."""
-    logger.insert_debug_to_log("Builders.json_source","enter function")
     src = (
         KafkaSource.builder()
         .set_bootstrap_servers(bootstrap)
@@ -126,7 +122,6 @@ def json_source(env: StreamExecutionEnvironment, topic: str, bootstrap: str):
 
 def build_string_kafka_sink(kafka_props: Dict[str, Any], topic: str) -> KafkaSink:
     """KafkaSink that expects **String** values (JSON text)."""
-    logger.insert_debug_to_log("Builders.json_source","enter function")
     bootstrap = kafka_props.get("bootstrap.servers")
     record_ser = (
         KafkaRecordSerializationSchema.builder()
@@ -145,7 +140,6 @@ def build_string_kafka_sink(kafka_props: Dict[str, Any], topic: str) -> KafkaSin
 
 def _dig(obj: Dict[str, Any], path: str):
     """Safely get nested value by dot path, returns None if any segment missing."""
-    logger.insert_debug_to_log("Builders._dig","enter function")
     cur = obj
     for seg in str(path).split("."):
         if cur is None:
@@ -159,7 +153,6 @@ def _dig(obj: Dict[str, Any], path: str):
 
 def make_key_extractor(cfg: Dict[str, Any]):
     """Returns a function that extracts parent_key from a tagged record using cfg."""
-    logger.insert_debug_to_log("Builders.make_key_extractor","enter function")
     parts_cfg = cfg["kafka"]["parts"]
 
     def extract(e: Dict[str, Any]):
@@ -180,6 +173,7 @@ def make_key_extractor(cfg: Dict[str, Any]):
 @dataclass
 class LabAgg:
     parent_key: str
+    message_id: str = None
     data: Optional[Dict[str, Any]] = None      # raw data divided by kind
     parts: Optional[Dict[str, Any]] = None     # parts dict from configuration
     last_version: Optional[str] = None         # hash/version to avoid dup emits
@@ -193,7 +187,6 @@ class LabAgg:
         return True
 
     def as_enriched(self) -> Optional[Dict[str, Any]]:
-        logger.insert_debug_to_log("Data.as_enriched","enter function")
         return self.data if self.is_ready() else None
 
 
@@ -207,6 +200,7 @@ class MergeAll(KeyedProcessFunction):
         desc = ValueStateDescriptor("agg", Types.PICKLED_BYTE_ARRAY())
         desc.enable_time_to_live(ttl)
         self.agg_state = ctx.get_state(desc)
+        self.logger = Logger()
 
     # ------- helpers -------
     def _get_or_init(self, parent_key: str) -> LabAgg:
@@ -226,7 +220,7 @@ class MergeAll(KeyedProcessFunction):
         tagged: {"kind": "<PART_NAME>", "row": {...}, "parent_key": <optional>}
         Emits: enriched dicts (yield)
         """
-        logger.insert_debug_to_log("DMergeAll.process_element","enter function")
+        self.logger.insert_debug_to_log("DMergeAll.process_element","enter function")
         kind = (tagged.get("kind") or "").strip()
         if not kind:
             return
@@ -238,7 +232,7 @@ class MergeAll(KeyedProcessFunction):
             parent_key = extractor(tagged)
         if not parent_key:
             # Debug: show why we dropped it
-            logger.insert_info_to_log("MergeAll.process_element",f"[PROCESS] drop: missing key for kind={kind}")
+            self.logger.insert_info_to_log("MergeAll.process_element",f"[PROCESS] drop: missing key for kind={kind}")
             return
 
         agg = self._get_or_init(parent_key)
@@ -246,6 +240,7 @@ class MergeAll(KeyedProcessFunction):
 
         if getattr(agg, "data", None) is None:
             agg.data = {}
+            agg.message_id = uuid.uuid4()
 
         # merge this part
         agg.data[kind] = row
@@ -256,14 +251,14 @@ class MergeAll(KeyedProcessFunction):
         # build enriched and de-dup BEFORE emitting
         enriched = agg.as_enriched()
         if enriched is None:
-            logger.insert_info_to_log("MergeAll.process_element",f"[PROCESS] not ready key={parent_key}, have={list(agg.data.keys())}")
+            self.logger.insert_info_to_log("MergeAll.process_element",f"[PROCESS] not ready key={parent_key}, have={list(agg.data.keys())}")
             return
 
         vhash = self._stable_hash(enriched)
         if vhash != getattr(agg, "last_version", None):
             agg.last_version = vhash
             self.agg_state.update(agg)
-            logger.insert_info_to_log("MergeAll.process_element",f"[PROCESS] EMIT key={parent_key}")
+            self.logger.insert_info_to_log("MergeAll.process_element",f"[PROCESS] EMIT key={parent_key}")
             yield enriched
         else:
             # unchanged; skip emit
@@ -276,7 +271,8 @@ class MergeAll(KeyedProcessFunction):
 def main(env):
     # Build per-topic sources → tagged union
     kafka_sources = []
-    logger = Logger(main_config)
+    logger = Logger()
+    logger.insert_debug_to_log("main","enter function")
     for part in data_config["kafka"]["parts"]:
         topic = part["topic"]
         bootstrap = part["bootstrap"]
@@ -321,12 +317,11 @@ def main(env):
         .sink_to(kafka_sink)
         .name("enriched-json-out")
     )
+    logger.insert_debug_to_log("main","execute flink environment")
     env.execute("Kafka Streaming with Flink Kafka Connector")
-    logger.insert_debug_to_log("env.execute","finish init")
+    logger.insert_debug_to_log("main","end function")
 
 # Execute
 if __name__ == "__main__":
-    logger.insert_info_to_log("SINK topic:",OUTPUT_TOPIC)
-    logger.insert_info_to_log("SINK bootstrap:",output_kafka_properties.get("bootstrap.servers"))
     main(env)
     
