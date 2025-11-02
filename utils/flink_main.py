@@ -187,6 +187,7 @@ class LabAgg:
         return True
 
     def as_enriched(self) -> Optional[Dict[str, Any]]:
+        self.data["message_id"] = self.message_id
         return self.data if self.is_ready() else None
 
 
@@ -240,7 +241,7 @@ class MergeAll(KeyedProcessFunction):
 
         if getattr(agg, "data", None) is None:
             agg.data = {}
-            agg.message_id = uuid.uuid4()
+            agg.message_id = str(uuid.uuid4())
 
         # merge this part
         agg.data[kind] = row
@@ -258,7 +259,7 @@ class MergeAll(KeyedProcessFunction):
         if vhash != getattr(agg, "last_version", None):
             agg.last_version = vhash
             self.agg_state.update(agg)
-            self.logger.insert_info_to_log("MergeAll.process_element",f"[PROCESS] EMIT key={parent_key}")
+            self.logger.insert_info_to_log("MergeAll.process_element",f"[PROCESS] EMIT mesaage_id={agg.message_id} key={parent_key}")
             yield enriched
         else:
             # unchanged; skip emit
