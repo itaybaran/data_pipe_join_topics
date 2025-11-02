@@ -245,6 +245,7 @@ class MergeAll(KeyedProcessFunction):
 
         # merge this part
         agg.data[kind] = row
+        agg.data["message_id"] = agg.message_id
 
         # persist state
         self.agg_state.update(agg)
