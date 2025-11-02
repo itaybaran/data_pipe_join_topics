@@ -271,56 +271,60 @@ class MergeAll(KeyedProcessFunction):
 # ========================
 def main(env):
     # Build per-topic sources → tagged union
-    kafka_sources = []
-    logger = Logger()
-    logger.insert_debug_to_log("main","enter function")
-    for part in data_config["kafka"]["parts"]:
-        topic = part["topic"]
-        bootstrap = part["bootstrap"]
-        name = part["name"]
+    try:
+        kafka_sources = []
+        logger = Logger()
+        logger.insert_debug_to_log("main","enter function")
+        for part in data_config["kafka"]["parts"]:
+            topic = part["topic"]
+            bootstrap = part["bootstrap"]
+            name = part["name"]
 
-        src = json_source(env, topic, bootstrap).map(
-            # bind name to default arg so lambda captures its value
-            lambda r, _name=name: {"kind": _name, "row": r},
-            output_type=Types.MAP(Types.STRING(), Types.PICKLED_BYTE_ARRAY())
+            src = json_source(env, topic, bootstrap).map(
+                # bind name to default arg so lambda captures its value
+                lambda r, _name=name: {"kind": _name, "row": r},
+                output_type=Types.MAP(Types.STRING(), Types.PICKLED_BYTE_ARRAY())
+            )
+            kafka_sources.append(src)
+
+        if not kafka_sources:
+            raise RuntimeError("No Kafka parts configured in configuration.yml")
+
+        # Union all sources
+        unioned = kafka_sources[0]
+        for i in range(1, len(kafka_sources)):
+            unioned = unioned.union(kafka_sources[i])
+
+        # Attach parent_key to each record (so keyBy doesn't rebuild it per record)
+        extract_parent_key = make_key_extractor(data_config)
+        with_key = (
+            unioned
+            .map(lambda e: {**e, "parent_key": extract_parent_key(e)},
+                output_type=Types.MAP(Types.STRING(), Types.PICKLED_BYTE_ARRAY()))
+            .filter(lambda e: e["parent_key"] is not None)
         )
-        kafka_sources.append(src)
 
-    if not kafka_sources:
-        raise RuntimeError("No Kafka parts configured in configuration.yml")
+        # Key by parent_key and merge into one per-key state object
+        result_stream = with_key.key_by(lambda e: e["parent_key"]).process(
+            MergeAll(data_config),
+            # Type bridge for Python operator results across the JVM boundary
+            output_type=Types.PICKLED_BYTE_ARRAY()
+        )
 
-    # Union all sources
-    unioned = kafka_sources[0]
-    for i in range(1, len(kafka_sources)):
-        unioned = unioned.union(kafka_sources[i])
+        # Sink: dict -> JSON string (ensure Java String for SimpleStringSchema)
+        kafka_sink = build_string_kafka_sink(output_kafka_properties, OUTPUT_TOPIC)
+        (
+            result_stream
+            .map(lambda d: json.dumps(d, ensure_ascii=False), output_type=Types.STRING())
+            .sink_to(kafka_sink)
+            .name("enriched-json-out")
+        )
+        logger.insert_debug_to_log("main","execute flink environment")
+        env.execute("Kafka Streaming with Flink Kafka Connector")
+        logger.insert_debug_to_log("main","end function")
+    except Exception as e:
+        logger.insert_error_to_log(-101,"Flink Environment issue:{}".format(str(e)))
 
-    # Attach parent_key to each record (so keyBy doesn't rebuild it per record)
-    extract_parent_key = make_key_extractor(data_config)
-    with_key = (
-        unioned
-        .map(lambda e: {**e, "parent_key": extract_parent_key(e)},
-            output_type=Types.MAP(Types.STRING(), Types.PICKLED_BYTE_ARRAY()))
-        .filter(lambda e: e["parent_key"] is not None)
-    )
-
-    # Key by parent_key and merge into one per-key state object
-    result_stream = with_key.key_by(lambda e: e["parent_key"]).process(
-        MergeAll(data_config),
-        # Type bridge for Python operator results across the JVM boundary
-        output_type=Types.PICKLED_BYTE_ARRAY()
-    )
-
-    # Sink: dict -> JSON string (ensure Java String for SimpleStringSchema)
-    kafka_sink = build_string_kafka_sink(output_kafka_properties, OUTPUT_TOPIC)
-    (
-        result_stream
-        .map(lambda d: json.dumps(d, ensure_ascii=False), output_type=Types.STRING())
-        .sink_to(kafka_sink)
-        .name("enriched-json-out")
-    )
-    logger.insert_debug_to_log("main","execute flink environment")
-    env.execute("Kafka Streaming with Flink Kafka Connector")
-    logger.insert_debug_to_log("main","end function")
 
 # Execute
 if __name__ == "__main__":
